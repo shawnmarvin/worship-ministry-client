@@ -1,103 +1,266 @@
-import React, { useRef, useState, useEffect } from "react";
+import React, { useState } from "react";
 import { transposeChord, getCapoChordShape } from "../utils/chordRegistry";
 
-// Helper to split slots into chunks that fit maxChars, keeping Chord/Lyric on separate lines
-function wrapChordLyricLines(slots, transpose, capo, key, maxChars) {
-  let chunks = [];
-  let chordLine = "";
-  let lyricLine = "";
-  let charCount = 0;
-
-  slots.forEach(({ chord, word }, i) => {
-    let transposedChord = transposeChord(chord, transpose, false, key);
-    let capoedChord = chord ? getCapoChordShape(transposedChord, capo, false, key) : "";
-    let lyricStr = word || "";
-    let leadingSpace = i > 0 ? " " : "";
-
-    // Pad chord to align with lyric
-    let chordPad = "";
-    if (lyricStr.length > capoedChord.length) {
-      chordPad = " ".repeat(lyricStr.length - capoedChord.length);
-    }
-    let chordChunk = leadingSpace + capoedChord + chordPad;
-    let lyricChunk = leadingSpace + lyricStr;
-
-    // If adding this would exceed maxChars, start a new chunk
-    if (charCount + chordChunk.length > maxChars && chordLine.length > 0) {
-      chunks.push({ chordLine, lyricLine });
-      chordLine = chordChunk.trimStart();
-      lyricLine = lyricChunk.trimStart();
-      charCount = chordChunk.length;
-    } else {
-      chordLine += chordChunk;
-      lyricLine += lyricChunk;
-      charCount += chordChunk.length;
-    }
-  });
-
-  if (chordLine.length > 0) {
-    chunks.push({ chordLine, lyricLine });
-  }
-  return chunks;
-}
-
-// Dynamically calculate maxChars based on container width and font size
-function useDynamicMaxChars(fontSize, rootRef) {
-  const [maxChars, setMaxChars] = useState(40);
-
-  useEffect(() => {
-    function calc() {
-      let container = rootRef.current;
-      const widthPx =
-        container?.offsetWidth ||
-        Math.min(window.innerWidth, 650);
-      let charWidthPx = 0.58 * fontSize * 16;
-      let chars = Math.max(10, Math.floor(widthPx / charWidthPx));
-      setMaxChars(chars);
-    }
-    calc();
-    window.addEventListener("resize", calc);
-    return () => window.removeEventListener("resize", calc);
-  }, [fontSize, rootRef]);
-
-  return maxChars;
-}
-
 export default function SongViewer({
-  song,
+  rawText,
   artist,
   composers,
-  key,
-  capo: initialCapo // default capo from backend, optional
+  songKey,
+  capo: initialCapo,
+  title
 }) {
   const [transpose, setTranspose] = useState(0);
   const [capo, setCapo] = useState(initialCapo ?? 0);
-  const [fontSize, setFontSize] = useState(1.05); // em
+  const [fontSize, setFontSize] = useState(16);
 
-  const rootRef = useRef(null);
-  const maxChars = useDynamicMaxChars(fontSize, rootRef);
+  // Function to transpose and apply capo to a chord
+  const processChord = (chord) => {
+    if (!chord) return chord;
+    let transposedChord = transposeChord(chord, transpose, false, songKey);
+    return getCapoChordShape(transposedChord, capo, false, songKey);
+  };
+
+  // Parse ChordPro format
+  const parseChordPro = (text) => {
+    const lines = text.split('\n');
+    const result = [];
+    let metadata = {};
+
+    lines.forEach((line) => {
+      // Handle metadata tags {title: Song Name}
+      const metaMatch = line.match(/^\{([^:]+):\s*(.+)\}$/);
+      if (metaMatch) {
+        metadata[metaMatch[1]] = metaMatch[2];
+        return;
+      }
+
+      // Handle section headers [Verse 1]
+      if (line.trim().match(/^\[([^\]]+)\]$/) && !line.includes(':')) {
+        result.push({
+          type: 'section',
+          content: line.trim().replace(/[\[\]]/g, '')
+        });
+        return;
+      }
+
+      // Handle chord/lyric lines
+      if (line.includes('[') && line.includes(']')) {
+        const slots = parseChordProLine(line);
+        result.push({
+          type: 'chordlyric',
+          slots: slots
+        });
+      } else if (line.trim()) {
+        // Regular lyric line
+        result.push({
+          type: 'lyric',
+          content: line
+        });
+      } else {
+        // Empty line
+        result.push({
+          type: 'empty'
+        });
+      }
+    });
+
+    return { metadata, content: result };
+  };
+
+  // Parse a single ChordPro line like "[C]Amazing [F]grace"
+  const parseChordProLine = (line) => {
+    const slots = [];
+    let currentPos = 0;
+    
+    // Find all chord patterns [chord]
+    const chordPattern = /\[([^\]]*)\]/g;
+    let match;
+    
+    while ((match = chordPattern.exec(line)) !== null) {
+      // Add any text before this chord
+      const textBefore = line.substring(currentPos, match.index);
+      
+      // Extract the chord
+      const chord = match[1];
+      
+      // Find the next chord or end of line
+      const nextChordMatch = chordPattern.exec(line);
+      let textAfter = '';
+      
+      if (nextChordMatch) {
+        // Reset position for next iteration
+        chordPattern.lastIndex = nextChordMatch.index;
+        textAfter = line.substring(match.index + match[0].length, nextChordMatch.index);
+      } else {
+        // This is the last chord, get remaining text
+        textAfter = line.substring(match.index + match[0].length);
+      }
+      
+      slots.push({
+        chord: chord,
+        textBefore: textBefore,
+        textAfter: textAfter
+      });
+      
+      currentPos = match.index + match[0].length + textAfter.length;
+    }
+    
+    // If no chords found, treat as plain text
+    if (slots.length === 0) {
+      slots.push({
+        chord: '',
+        textBefore: '',
+        textAfter: line
+      });
+    }
+    
+    return slots;
+  };
+
+  // Render ChordPro content with proper alignment
+  const renderChordPro = (parsedData) => {
+    return parsedData.content.map((item, index) => {
+      switch (item.type) {
+        case 'section':
+          return (
+            <div
+              key={index}
+              style={{
+                fontSize: `${fontSize + 2}px`,
+                fontFamily: "'Courier New', Courier, monospace",
+                fontWeight: 'bold',
+                margin: '1.5em 0 0.5em 0',
+                color: '#2d2d2d',
+                letterSpacing: '0.05em'
+              }}
+            >
+              [{item.content}]
+            </div>
+          );
+          
+        case 'chordlyric':
+          return (
+            <div key={index} style={{ 
+              marginBottom: '1em',
+              position: 'relative'
+            }}>
+              {item.slots.map((slot, slotIndex) => (
+                <span key={slotIndex} style={{ 
+                  display: 'inline-block',
+                  position: 'relative',
+                  verticalAlign: 'top'
+                }}>
+                  {/* Text before chord */}
+                  {slot.textBefore && (
+                    <span style={{
+                      fontSize: `${fontSize}px`,
+                      fontFamily: "'Courier New', Courier, monospace",
+                      color: '#333',
+                      whiteSpace: 'pre'
+                    }}>
+                      {slot.textBefore}
+                    </span>
+                  )}
+                  
+                  {/* Chord and text after it */}
+                  <span style={{
+                    display: 'inline-block',
+                    position: 'relative',
+                    verticalAlign: 'top'
+                  }}>
+                    {/* Chord line */}
+                    {slot.chord && (
+                      <div style={{
+                        fontSize: `${fontSize}px`,
+                        fontFamily: "'Courier New', Courier, monospace",
+                        color: '#2d7d32',
+                        fontWeight: 'bold',
+                        lineHeight: '1.2',
+                        minHeight: `${fontSize * 1.2}px`,
+                        whiteSpace: 'pre'
+                      }}>
+                        {processChord(slot.chord)}
+                      </div>
+                    )}
+                    
+                    {/* Text after chord */}
+                    <div style={{
+                      fontSize: `${fontSize}px`,
+                      fontFamily: "'Courier New', Courier, monospace",
+                      color: '#333',
+                      lineHeight: '1.2',
+                      whiteSpace: 'pre',
+                      marginTop: slot.chord ? `-${fontSize * 1.2}px` : '0'
+                    }}>
+                      {slot.textAfter}
+                    </div>
+                  </span>
+                </span>
+              ))}
+            </div>
+          );
+          
+        case 'lyric':
+          return (
+            <div
+              key={index}
+              style={{
+                fontSize: `${fontSize}px`,
+                fontFamily: "'Courier New', Courier, monospace",
+                lineHeight: '1.4',
+                color: '#333',
+                marginBottom: '0.5em',
+                whiteSpace: 'pre-wrap'
+              }}
+            >
+              {item.content}
+            </div>
+          );
+          
+        case 'empty':
+          return <div key={index} style={{ height: '0.5em' }} />;
+          
+        default:
+          return null;
+      }
+    });
+  };
+
+  const parsedData = parseChordPro(rawText || '');
 
   return (
     <div>
       {/* Song Metadata */}
       <div style={{
         marginBottom: 24,
-        padding: '4px 0 8px 0',
+        padding: '8px 0 12px 0',
         borderBottom: '1px solid #eee',
         fontFamily: "'Inter', Arial, sans-serif",
         fontSize: '1.02em',
         color: '#444'
       }}>
+        {title && <h2 style={{ margin: '0 0 0.5rem 0', color: '#2c3e50' }}>{title}</h2>}
         {artist && <div><strong>Artist:</strong> {artist}</div>}
         {composers && composers.length > 0 && (
           <div>
             <strong>Composer{composers.length > 1 ? "s" : ""}:</strong> {composers.join(", ")}
           </div>
         )}
-        {key && <div><strong>Key:</strong> {key}</div>}
+        {songKey && <div><strong>Key:</strong> {songKey}</div>}
+        <div style={{ marginTop: '0.5rem', fontSize: '0.9em', color: '#2d7d32' }}>
+          <strong>Format:</strong> ChordPro
+        </div>
       </div>
+      
       {/* Transpose, Capo & Font Size Controls */}
-      <div style={{ marginBottom: 16, display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'center' }}>
+      <div style={{ 
+        marginBottom: 16, 
+        display: 'flex', 
+        flexWrap: 'wrap', 
+        gap: 16, 
+        alignItems: 'center',
+        fontFamily: "'Inter', Arial, sans-serif"
+      }}>
         <div>
           <label>Transpose: {transpose}</label>
           <input
@@ -122,100 +285,45 @@ export default function SongViewer({
         </div>
         <div>
           <label>Font Size: </label>
-          <button onClick={() => setFontSize(x => Math.max(0.7, x - 0.1))} style={{margin: '0 4px'}}>A-</button>
-          <span style={{display: 'inline-block', width: 32, textAlign: 'center'}}>{Math.round(fontSize * 100)}%</span>
-          <button onClick={() => setFontSize(x => Math.min(2.4, x + 0.1))} style={{margin: '0 4px'}}>A+</button>
+          <button 
+            onClick={() => setFontSize(x => Math.max(12, x - 1))} 
+            style={{margin: '0 4px', padding: '4px 8px'}}
+          >
+            A-
+          </button>
+          <span style={{display: 'inline-block', width: 40, textAlign: 'center'}}>
+            {fontSize}px
+          </span>
+          <button 
+            onClick={() => setFontSize(x => Math.min(24, x + 1))} 
+            style={{margin: '0 4px', padding: '4px 8px'}}
+          >
+            A+
+          </button>
         </div>
       </div>
-      {/* Song Rendering */}
-      <div className="song-root" ref={rootRef}>
-        {song.map((line, i) => {
-          if (line.section) {
-            return (
-              <div
-                key={`section-${i}`}
-                className="song-section-heading"
-                style={{
-                  fontSize: `${fontSize * 1.1}em`
-                }}
-              >
-                [{line.section}]
-              </div>
-            );
-          }
-          if (line.slots) {
-            const hasWords = line.slots.some(({ word }) => word && word.trim());
-            const chunks = wrapChordLyricLines(line.slots, transpose, capo, key, maxChars);
-            return (
-              <div key={i} className="song-line">
-                {chunks.map((chunk, ci) => (
-                  <React.Fragment key={ci}>
-                    <pre
-                      className="song-chord-line"
-                      style={{
-                        margin: 0,
-                        fontSize: `${fontSize}em`,
-                        fontFamily: "'Courier New', monospace",
-                        overflowX: "initial"
-                      }}
-                    >{chunk.chordLine}</pre>
-                    {hasWords && (
-                      <pre
-                        className="song-lyric-line"
-                        style={{
-                          margin: 0,
-                          fontSize: `${fontSize}em`,
-                          fontFamily: "'Courier New', monospace",
-                          overflowX: "initial"
-                        }}
-                      >{chunk.lyricLine}</pre>
-                    )}
-                  </React.Fragment>
-                ))}
-              </div>
-            );
-          }
-          return null;
-        })}
+      
+      {/* Song Content */}
+      <div style={{
+        maxWidth: '1000px',
+        margin: '0 auto',
+        padding: '1.5rem',
+        background: '#fafafa',
+        border: '1px solid #e0e0e0',
+        borderRadius: '8px',
+        overflow: 'auto'
+      }}>
+        {rawText ? renderChordPro(parsedData) : (
+          <div style={{ 
+            textAlign: 'center', 
+            padding: '2rem', 
+            color: '#666',
+            fontFamily: "'Inter', Arial, sans-serif"
+          }}>
+            No chord/lyric content available for this song.
+          </div>
+        )}
       </div>
-      {/* Responsive styles */}
-      <style>{`
-        .song-root {
-          max-width: 650px;
-          margin: 0 auto;
-        }
-        @media (max-width: 700px) {
-          .song-root {
-            max-width: 90vw;
-          }
-        }
-        @media (max-width: 450px) {
-          .song-root {
-            max-width: 100vw !important;
-            min-width: unset;
-            padding-left: 0;
-            padding-right: 0;
-          }
-        }
-        .song-section-heading {
-          margin-top: 1.5em;
-          margin-bottom: 0.5em;
-          font-weight: bold;
-          letter-spacing: 0.05em;
-          color: #2d2d2d;
-          font-family: 'Courier New', Courier, monospace;
-        }
-        .song-line {
-          margin-bottom: 0.5em;
-        }
-        .song-chord-line,
-        .song-lyric-line {
-          line-height: 1.5em;
-          overflow-x: initial;
-          white-space: pre;
-          word-break: break-all;
-        }
-      `}</style>
     </div>
   );
 }
